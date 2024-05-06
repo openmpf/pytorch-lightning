@@ -11,10 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import itertools
+import shutil
 from contextlib import ExitStack
 from datetime import timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, ContextManager, Dict, Literal, Optional, TypeVar, Union
+from typing import TYPE_CHECKING, Any, Callable, ContextManager, Dict, Literal, Optional, TypeVar, Union, TypeGuard
 
 import torch
 from lightning_utilities.core.rank_zero import rank_zero_only as utils_rank_zero_only
@@ -28,10 +30,11 @@ from lightning.fabric.plugins.collectives.torch_collective import default_pg_tim
 from lightning.fabric.strategies.fsdp import (
     _distributed_checkpoint_load,
     _distributed_checkpoint_save,
+    _is_sharded_checkpoint,
 )
 from lightning.fabric.strategies.launchers.subprocess_script import _SubprocessScriptLauncher
 from lightning.fabric.strategies.parallel import ParallelStrategy
-from lightning.fabric.strategies.strategy import TBroadcast, _BackwardSyncControl
+from lightning.fabric.strategies.strategy import TBroadcast, _BackwardSyncControl, _apply_filter
 from lightning.fabric.utilities.distributed import (
     ReduceOp,
     _distributed_is_initialized,
@@ -39,12 +42,13 @@ from lightning.fabric.utilities.distributed import (
     _init_dist_connection,
     _sync_ddp_if_available,
 )
+from lightning.fabric.utilities.load import _METADATA_FILENAME
 from lightning.fabric.utilities.distributed import group as _group
 from lightning.fabric.utilities.imports import _TORCH_GREATER_EQUAL_2_3
 from lightning.fabric.utilities.init import _materialize_distributed_module
 from lightning.fabric.utilities.rank_zero import rank_zero_only
 from lightning.fabric.utilities.seed import reset_seed
-from lightning.fabric.utilities.types import _PATH
+from lightning.fabric.utilities.types import _PATH, _Stateful
 
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
@@ -68,7 +72,9 @@ class ModelParallelStrategy(ParallelStrategy):
             sets this size to the number of nodes in the cluster.
         tensor_parallel_size: The number of devices within a tensor-parallel group. Defaults to ``"auto"``, which
             sets this size to the number of GPUs in a single node.
-
+        save_distributed_checkpoint: If ``True``, each rank saves its shard of weights and optimizer states to a file.
+            The checkpoint is a folder with as many files as the world size.
+            If ``False``, the full weights and optimizer states get assembled on rank 0 and saved to a single file.
     """
 
     def __init__(
@@ -76,6 +82,7 @@ class ModelParallelStrategy(ParallelStrategy):
         parallelize_fn: Callable[[TModel, "DeviceMesh"], TModel],
         data_parallel_size: Union[Literal["auto"], int] = "auto",
         tensor_parallel_size: Union[Literal["auto"], int] = "auto",
+        save_distributed_checkpoint: bool = True,
         process_group_backend: Optional[str] = None,
         timeout: Optional[timedelta] = default_pg_timeout,
     ) -> None:
@@ -86,6 +93,7 @@ class ModelParallelStrategy(ParallelStrategy):
         self._data_parallel_size = data_parallel_size
         self._tensor_parallel_size = tensor_parallel_size
         self._num_nodes = 1
+        self._save_distributed_checkpoint = save_distributed_checkpoint
         self._process_group_backend: Optional[str] = process_group_backend
         self._timeout: Optional[timedelta] = timeout
         self._backward_sync_control = _ParallelBackwardSyncControl()
@@ -216,20 +224,33 @@ class ModelParallelStrategy(ParallelStrategy):
         storage_options: Optional[Any] = None,
         filter: Optional[Dict[str, Callable[[str, Any], bool]]] = None,
     ) -> None:
-        """Save model, optimizer, and other state to a checkpoint on disk."""
+        """Save model, optimizer, and other state to a checkpoint on disk.
+
+        If the state-dict-type is ``'full'``, the checkpoint will be written to a single file containing the weights,
+        optimizer state and other metadata. If the state-dict-type is ``'sharded'``, the checkpoint gets saved as a
+        directory containing one file per process, with model- and optimizer shards stored per file. Additionally, it
+        creates a metadata file `meta.pt` with the rest of the user's state (only saved from rank 0).
+
+        """
         if storage_options is not None:
             raise TypeError(
                 f"`{self.__class__.__name__}.save_checkpoint(..., storage_options=...)` is not supported because"
                 f" `{self.__class__.__name__}` does not use the `CheckpointIO`."
             )
-        if filter is not None and self._state_dict_type == "sharded":
+        if filter is not None and self._save_distributed_checkpoint:
             # https://github.com/pytorch/pytorch/issues/105379
             raise NotImplementedError(
                 f"{self.__class__.__name__} doesn't support loading sharded filtered checkpoints, so saving them is disabled."
             )
         # broadcast the path from rank 0 to ensure all the states are saved in a common path
         path = Path(self.broadcast(path))
-        _save_checkpoint(path=path, state=state, filter=filter, rank=self.global_rank)
+        _save_checkpoint(
+            path=path,
+            state=state,
+            full_state_dict=self._save_distributed_checkpoint,
+            rank=self.global_rank,
+            filter=filter,
+        )
 
     @override
     def load_checkpoint(
@@ -314,85 +335,70 @@ class _FSDPNoSync(ContextManager):
         self._set_requires_grad_sync(self._enabled)
 
 
-def _save_checkpoint(path, state, full_state_dict: bool, filter, rank: int):
-    # """Save model, optimizer, and other state to a checkpoint on disk.
-    #
-    # If the state-dict-type is ``'full'``, the checkpoint will be written to a single file containing the weights,
-    # optimizer state and other metadata. If the state-dict-type is ``'sharded'``, the checkpoint gets saved as a
-    # directory containing one file per process, with model- and optimizer shards stored per file. Additionally, it
-    # creates a metadata file `meta.pt` with the rest of the user's state (only saved from rank 0).
-    #
-    # """
-
-    # broadcast the path from rank 0 to ensure all the states are saved in a common path
+def _save_checkpoint(
+    path: _PATH,
+    state: Dict[str, Union[Module, Optimizer, Any]],
+    full_state_dict: bool,
+    rank: int,
+    filter: Optional[Dict[str, Callable[[str, Any], bool]]] = None,
+):
     if path.is_dir() and full_state_dict and not _is_sharded_checkpoint(path):
         raise IsADirectoryError(f"The checkpoint path exists and is a directory: {path}")
 
-    # modules = [module for module in state.values() if _has_fsdp_modules(module)]
-    # if len(modules) == 0:
-    #     raise ValueError(
-    #         "Could not find a FSDP model in the provided checkpoint state. Please provide the model as"
-    #         " part of the state like so: `save_checkpoint(..., state={'model': model, ...})`. Make sure"
-    #         " you set up the model (and optimizers if any) through the strategy before saving the checkpoint."
-    #     )
-    # if len(modules) > 1:
-    #     raise ValueError(
-    #         "Found multiple FSDP models in the given state. Saving checkpoints with FSDP is"
-    #         " currently limited to a single model per checkpoint. To save multiple models, call the"
-    #         " save method for each model separately with a different path."
-    #     )
-    # module = modules[0]
+    modules = [module for module in state.values() if _has_fsdp2_modules(module)]
+    if len(modules) == 0:
+        raise ValueError(
+            "Could not find a FSDP model in the provided checkpoint state. Please provide the model as"
+            " part of the state like so: `save_checkpoint(..., state={'model': model, ...})`. Make sure"
+            " you set up the model (and optimizers if any) through the strategy before saving the checkpoint."
+        )
+    if len(modules) > 1:
+        raise ValueError(
+            "Found multiple FSDP models in the given state. Saving checkpoints with FSDP is"
+            " currently limited to a single model per checkpoint. To save multiple models, call the"
+            " save method for each model separately with a different path."
+        )
+    module = modules[0]
 
     from torch.distributed.checkpoint.state_dict import StateDictOptions
+    from torch.distributed.checkpoint.state_dict import get_model_state_dict, get_optimizer_state_dict
 
     state_dict_options = StateDictOptions(full_state_dict=full_state_dict, cpu_offload=True)
-    if self._state_dict_type == "sharded":
+
+    # replace the modules and optimizer objects in the state with their local state dict
+    # and separate the user's metadata
+    converted_state: Dict[str, Any] = {}
+    metadata: Dict[str, Any] = {}
+    for key, obj in state.items():
+        converted: Any
+        if isinstance(obj, Module):
+            converted = get_model_state_dict(obj, options=state_dict_options)
+            target_dict = converted_state
+        elif isinstance(obj, Optimizer):
+            converted = get_optimizer_state_dict(module, obj, options=state_dict_options)
+            target_dict = converted_state
+        else:  # everything not a module or optimizer is considered metadata
+            converted = obj.state_dict() if isinstance(obj, _Stateful) else obj
+            target_dict = metadata
+        _apply_filter(key, filter or {}, converted, target_dict)
+
+    if full_state_dict:
+        if _is_sharded_checkpoint(path):
+            shutil.rmtree(path)
+        converted_state.update(metadata)
+        if rank == 0:
+            torch.save(converted_state, path)
+    else:
         if path.is_file():
             path.unlink()
         path.mkdir(parents=True, exist_ok=True)
-
-        state_dict_ctx = _get_sharded_state_dict_context(module)
-
-        # replace the modules and optimizer objects in the state with their local state dict
-        # and separate the user's metadata
-        converted_state: Dict[str, Any] = {}
-        metadata: Dict[str, Any] = {}
-        with state_dict_ctx:
-            for key, obj in state.items():
-                converted: Any
-                if isinstance(obj, Module):
-                    converted = obj.state_dict()
-                    target_dict = converted_state
-                elif isinstance(obj, Optimizer):
-                    converted = FSDP.optim_state_dict(module, obj)
-                    target_dict = converted_state
-                else:  # everything not a module or optimizer is considered metadata
-                    converted = obj.state_dict() if isinstance(obj, _Stateful) else obj
-                    target_dict = metadata
-                _apply_filter(key, filter or {}, converted, target_dict)
-
         _distributed_checkpoint_save(converted_state, path)
-
-        if self.global_rank == 0:
+        if rank == 0:
             torch.save(metadata, path / _METADATA_FILENAME)
 
-    elif self._state_dict_type == "full":
-        if _is_sharded_checkpoint(path):
-            shutil.rmtree(path)
 
-        state_dict_ctx = _get_full_state_dict_context(module, world_size=self.world_size)
-        full_state: Dict[str, Any] = {}
-        with state_dict_ctx:
-            for key, obj in state.items():
-                if isinstance(obj, Module):
-                    converted = obj.state_dict()
-                elif isinstance(obj, Optimizer):
-                    converted = FSDP.optim_state_dict(module, obj)
-                else:  # everything not a module or optimizer is considered metadata
-                    converted = obj.state_dict() if isinstance(obj, _Stateful) else obj
-                _apply_filter(key, filter or {}, converted, full_state)
+def _has_fsdp2_modules(module: object) -> TypeGuard[Module]:
+    # TODO: in 2.4 nightly, this was renamed FSDPModule
+    from torch.distributed._composable.fsdp.fully_shard import FSDP as FSDPModule
 
-        if self.global_rank == 0:
-            torch.save(full_state, path)
-    else:
-        raise ValueError(f"Unknown state_dict_type: {self._state_dict_type}")
+    return isinstance(module, Module) and any(isinstance(m, FSDPModule) for m in module.modules())
