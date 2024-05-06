@@ -286,20 +286,188 @@ def test_train_save_load(precision, tmp_path):
         torch.testing.assert_close(p0, p1, atol=0, rtol=0, equal_nan=True)
 
     # check user data in state reloaded
-    # TODO: This should be 1, torch.distributed.checkpoint only supports tensor data
-    assert state["steps"] == 0
+    assert state["steps"] == 1
     assert not metadata
 
     # TODO: Test strict and non-strict loading here once supported
-    # attempt to load a key not in the metadata checkpoint
-    # state = {"model": model, "coconut": 11}
-    # with pytest.raises(KeyError, match="The requested state contains a key 'coconut' that does not exist"):
-    #     fabric.load(checkpoint_path, state)
 
-    # # `strict=False` ignores the missing key
-    # state = {"model": trainer.model, "coconut": 11}
-    # fabric.load(checkpoint_path, state, strict=False)
-    # assert state["coconut"] == 11
+    # attempt to load a key not in the metadata checkpoint
+    state = {"model": model, "coconut": 11}
+    with pytest.raises(KeyError, match="The requested state contains a key 'coconut' that does not exist"):
+        fabric.load(checkpoint_path, state)
+
+    # `strict=False` ignores the missing key
+    state = {"model": model, "coconut": 11}
+    fabric.load(checkpoint_path, state, strict=False)
+    assert state["coconut"] == 11
+
+
+@RunIf(min_cuda_gpus=2, standalone=True)
+def test_save_full_state_dict(tmp_path):
+    """Test that FSDP saves the full state into a single file with `state_dict_type="full"`."""
+    fabric = Fabric(
+        accelerator="cuda",
+        strategy=FSDPStrategy(auto_wrap_policy=always_wrap_policy, state_dict_type="full"),
+        devices=2,
+    )
+    fabric.launch()
+    trainer = BasicTrainer(fabric)
+    trainer.run()
+
+    checkpoint_path = Path(fabric.broadcast(str(tmp_path / "fsdp-checkpoint.pt")))
+
+    state = {"model": trainer.model, "optimizer": trainer.optimizer, "steps": 1}
+    fabric.save(checkpoint_path, state)
+
+    checkpoint = torch.load(checkpoint_path)
+    assert checkpoint["steps"] == 1
+    loaded_state_dict = checkpoint["model"]
+
+    # assert the correct state model was saved
+    with FullyShardedDataParallel.summon_full_params(trainer.model):
+        state_dict = trainer.model.state_dict()
+        assert set(loaded_state_dict.keys()) == set(state_dict.keys())
+        for param_name in state_dict:
+            assert torch.equal(loaded_state_dict[param_name], state_dict[param_name].cpu())
+        params_before = [p.cpu() for p in trainer.model.parameters()]
+
+    # assert the correct optimizer state was saved
+    optimizer_state_before = FullyShardedDataParallel.full_optim_state_dict(
+        trainer.model, trainer.optimizer, rank0_only=False
+    )
+    assert set(checkpoint["optimizer"].keys()) == set(optimizer_state_before.keys()) == {"state", "param_groups"}
+
+    # 1. verify the FSDP state can be loaded back into a FSDP model/strategy directly
+    fabric = Fabric(
+        accelerator="cuda",
+        strategy=FSDPStrategy(auto_wrap_policy=always_wrap_policy),
+        devices=2,
+    )
+    fabric.launch()
+    trainer = BasicTrainer(fabric)
+    trainer.run()
+    metadata = fabric.load(checkpoint_path, {"model": trainer.model, "optimizer": trainer.optimizer})
+    assert metadata == {"steps": 1}
+
+    with FullyShardedDataParallel.summon_full_params(trainer.model):
+        params_after = list(trainer.model.parameters())
+        assert all(torch.equal(p0.cpu(), p1.cpu()) for p0, p1 in zip(params_before, params_after))
+
+    # assert the correct optimizer state was loaded
+    optimizer_state_after = FullyShardedDataParallel.full_optim_state_dict(
+        trainer.model, trainer.optimizer, rank0_only=False
+    )
+    assert set(optimizer_state_after.keys()) == set(optimizer_state_before.keys()) == {"state", "param_groups"}
+    torch.testing.assert_close(optimizer_state_after["state"], optimizer_state_before["state"], atol=0, rtol=0)
+    assert optimizer_state_after["param_groups"] == optimizer_state_before["param_groups"]
+
+    # run a step to verify the optimizer state is correct
+    trainer.run()
+
+    # 2. verify the FSDP state can be loaded back into a single-device model/strategy
+    fabric = Fabric(accelerator="cpu", devices=1)
+    trainer = BasicTrainer(fabric)
+    trainer.run()
+    metadata = fabric.load(checkpoint_path, {"model": trainer.model, "optimizer": trainer.optimizer})
+    assert metadata == {"steps": 1}
+    params_after = list(trainer.model.parameters())
+    assert all(torch.equal(p0, p1) for p0, p1 in zip(params_before, params_after))
+
+    # get optimizer state after loading
+    normal_checkpoint_path = Path(fabric.broadcast(str(tmp_path / "normal-checkpoint.pt")))
+    fabric.save(normal_checkpoint_path, {"model": trainer.model, "optimizer": trainer.optimizer, "steps": 2})
+    optimizer_state_after = torch.load(normal_checkpoint_path)["optimizer"]
+    optimizer_state_after = FullyShardedDataParallel.rekey_optim_state_dict(
+        optimizer_state_after, optim_state_key_type=OptimStateKeyType.PARAM_NAME, model=trainer.model
+    )
+
+    # assert the correct optimizer state was loaded
+    assert set(optimizer_state_after.keys()) == set(optimizer_state_before.keys()) == {"state", "param_groups"}
+    torch.testing.assert_close(optimizer_state_after["state"], optimizer_state_before["state"], atol=0, rtol=0)
+
+    # run a step to verify the optimizer state is correct
+    trainer.run()
+
+    # 3. verify that a single-device model/strategy states can be loaded into a FSDP model/strategy
+    fabric = Fabric(
+        accelerator="cuda",
+        strategy=FSDPStrategy(auto_wrap_policy=always_wrap_policy),
+        devices=2,
+    )
+    fabric.launch()
+    trainer = BasicTrainer(fabric)
+    trainer.run()
+    metadata = fabric.load(normal_checkpoint_path, {"model": trainer.model, "optimizer": trainer.optimizer})
+    assert metadata == {"steps": 2}
+
+    with FullyShardedDataParallel.summon_full_params(trainer.model):
+        params_after = list(trainer.model.parameters())
+        assert all(torch.equal(p0.cpu(), p1.cpu()) for p0, p1 in zip(params_before, params_after))
+
+    # assert the correct optimizer state was loaded
+    optimizer_state_after = FullyShardedDataParallel.full_optim_state_dict(
+        trainer.model, trainer.optimizer, rank0_only=False
+    )
+    assert set(optimizer_state_after.keys()) == set(optimizer_state_before.keys()) == {"state", "param_groups"}
+    torch.testing.assert_close(optimizer_state_after["state"], optimizer_state_before["state"], atol=0, rtol=0)
+    assert optimizer_state_after["param_groups"] == optimizer_state_before["param_groups"]
+
+    # run a step to verify the optimizer state is correct
+    trainer.run()
+
+
+@RunIf(min_cuda_gpus=2, standalone=True)
+def test_load_full_state_dict_into_sharded_model(tmp_path):
+    """Test that the strategy can load a full-state checkpoint into a FSDP sharded model."""
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+    fabric = Fabric(accelerator="cuda", devices=1)
+    fabric.seed_everything(0)
+    trainer = BasicTrainer(fabric)
+    trainer.run()
+
+    # Save a full-state-dict checkpoint
+    checkpoint_path = Path(fabric.broadcast(str(tmp_path / "full-checkpoint.pt")))
+    state = {"model": trainer.model, "optimizer": trainer.optimizer, "steps": 1}
+    fabric.save(checkpoint_path, state)
+
+    # Gather all weights and store a copy manually
+    with FSDP.summon_full_params(trainer.model, writeback=False, rank0_only=False):
+        params_before = torch.cat([p.cpu().view(-1) for p in trainer.model.parameters()])
+
+    # Create a FSDP sharded model
+    fabric = Fabric(
+        accelerator="cuda",
+        strategy=FSDPStrategy(auto_wrap_policy=always_wrap_policy),
+        devices=2,
+    )
+    fabric.launch()
+    trainer = BasicTrainer(fabric)
+    trainer.run()
+
+    state = {"model": trainer.model, "optimizer": trainer.optimizer, "steps": 44}
+    fabric.load(checkpoint_path, state)
+    assert state["steps"] == 1
+
+    # Gather all weights and compare
+    with FSDP.summon_full_params(trainer.model, writeback=False, rank0_only=False):
+        params_after = torch.cat([p.cpu().view(-1) for p in trainer.model.parameters()])
+    assert torch.equal(params_before, params_after)
+
+    # Create a raw state-dict checkpoint to test `Fabric.load_raw` too
+    raw_checkpoint_path = checkpoint_path.with_name("model-state-dict")
+    if fabric.global_rank == 0:
+        checkpoint = torch.load(checkpoint_path)
+        torch.save(checkpoint["model"], raw_checkpoint_path)
+    fabric.barrier()
+
+    trainer.run()
+    fabric.load_raw(raw_checkpoint_path, trainer.model)
+
+    # Gather all weights and compare
+    with FSDP.summon_full_params(trainer.model, writeback=False, rank0_only=False):
+        params_after = torch.cat([p.cpu().view(-1) for p in trainer.model.parameters()])
+    assert torch.equal(params_before, params_after)
 
 
 @RunIf(min_torch="2.3", min_cuda_gpus=2, skip_windows=True, standalone=True)
@@ -357,6 +525,30 @@ def test_module_init_context(precision, expected_dtype):
 
     _run_setup_assertions(empty_init=False, expected_device=torch.device("cpu"))
     _run_setup_assertions(empty_init=True, expected_device=torch.device("meta"))
+
+
+
+@RunIf(min_cuda_gpus=2, standalone=True)
+def test_save_filter(tmp_path):
+    fabric = Fabric(accelerator="cuda", strategy=FSDPStrategy(state_dict_type="full"), devices=2)
+    fabric.launch()
+    model = nn.Linear(32, 2)
+    model = fabric.setup_module(model)
+
+    tmp_path = Path(fabric.broadcast(str(tmp_path)))
+    state = {"model": model}
+    filter = {"model": lambda k, v: "bias" in k}
+
+    checkpoint_path = tmp_path / "full.pth"
+    fabric.save(checkpoint_path, state, filter=filter)
+    checkpoint = torch.load(checkpoint_path)["model"]
+    assert set(checkpoint) == {"bias"}
+    assert isinstance(checkpoint["bias"], torch.Tensor)
+
+    fabric.strategy._state_dict_type = "sharded"
+    checkpoint_path = tmp_path / "sharded"
+    with pytest.raises(NotImplementedError, match="doesn't support loading sharded filtered"):
+        fabric.save(checkpoint_path, state, filter=filter)
 
 
 def _parallelize_single_linear_tp_fsdp2(model, device_mesh):
@@ -436,8 +628,6 @@ def test_clip_gradients(clip_type, precision):
     optimizer.zero_grad()
 
 
-# TODO: Support loading full checkpoint
-@pytest.mark.xfail(raises=NotADirectoryError, reason="Loading from full checkpoint not supported yet.")
 @RunIf(min_torch="2.3", min_cuda_gpus=4, standalone=True)
 def test_save_sharded_and_consolidate_and_load(tmp_path):
     """Test the consolidation of a distributed (DTensor) checkpoint into a single file."""

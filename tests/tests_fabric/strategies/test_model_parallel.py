@@ -173,6 +173,165 @@ def test_save_checkpoint_storage_options(tmp_path):
         strategy.save_checkpoint(path=tmp_path, state=Mock(), storage_options=Mock())
 
 
+@mock.patch("lightning.fabric.strategies.fsdp.FSDPStrategy.broadcast", lambda _, x: x)
+@mock.patch("lightning.fabric.strategies.fsdp._get_full_state_dict_context")
+@mock.patch("lightning.fabric.strategies.fsdp._get_sharded_state_dict_context")
+@mock.patch("lightning.fabric.strategies.fsdp.torch.save")
+@mock.patch("lightning.fabric.strategies.fsdp.shutil")
+def test_save_checkpoint_path_exists(shutil_mock, torch_save_mock, __, ___, tmp_path):
+    strategy = FSDPStrategy(state_dict_type="full")
+
+    # state_dict_type='full', path exists, path is not a sharded checkpoint: error
+    path = tmp_path / "not-empty"
+    path.mkdir()
+    (path / "file").touch()
+    assert not _is_sharded_checkpoint(path)
+    with pytest.raises(IsADirectoryError, match="exists and is a directory"):
+        strategy.save_checkpoint(path=path, state=Mock())
+
+    # state_dict_type='full', path exists, path is a sharded checkpoint: no error (overwrite)
+    path = tmp_path / "sharded-checkpoint"
+    path.mkdir()
+    (path / "meta.pt").touch()
+    assert _is_sharded_checkpoint(path)
+    model = Mock(spec=FullyShardedDataParallel)
+    model.modules.return_value = [model]
+    strategy.save_checkpoint(path=path, state={"model": model})
+    shutil_mock.rmtree.assert_called_once_with(path)
+
+    # state_dict_type='full', path exists, path is a file: no error (overwrite)
+    path = tmp_path / "file.pt"
+    path.touch()
+    model = Mock(spec=FullyShardedDataParallel)
+    model.modules.return_value = [model]
+    torch_save_mock.reset_mock()
+    strategy.save_checkpoint(path=path, state={"model": model})
+    torch_save_mock.assert_called_once()
+
+    strategy = FSDPStrategy(state_dict_type="sharded")
+    save_mock = mock.patch(
+        "torch.distributed.checkpoint.save"
+        if _TORCH_GREATER_EQUAL_2_2
+        else "torch.distributed.checkpoint.save_state_dict"
+    )
+
+    # state_dict_type='sharded', path exists, path is a folder: no error (overwrite)
+    path = tmp_path / "not-empty-2"
+    path.mkdir()
+    (path / "file").touch()
+    model = Mock(spec=FullyShardedDataParallel)
+    model.modules.return_value = [model]
+    with save_mock:
+        strategy.save_checkpoint(path=path, state={"model": model})
+    assert (path / "file").exists()
+
+    # state_dict_type='sharded', path exists, path is a file: no error (overwrite)
+    path = tmp_path / "file-2.pt"
+    path.touch()
+    model = Mock(spec=FullyShardedDataParallel)
+    model.modules.return_value = [model]
+    with save_mock:
+        strategy.save_checkpoint(path=path, state={"model": model})
+    assert path.is_dir()
+
+
+@mock.patch("lightning.fabric.strategies.fsdp.FSDPStrategy.broadcast", lambda _, x: x)
+def test_save_checkpoint_one_fsdp_module_required(tmp_path):
+    """Test that the FSDP strategy can only save one FSDP model per checkpoint."""
+    strategy = FSDPStrategy()
+
+    # missing FSDP model
+    with pytest.raises(ValueError, match="Could not find a FSDP model in the provided checkpoint state."):
+        strategy.save_checkpoint(path=tmp_path, state={})
+    with pytest.raises(ValueError, match="Could not find a FSDP model in the provided checkpoint state."):
+        strategy.load_checkpoint(path=tmp_path, state={"model": torch.nn.Linear(3, 3)})
+
+    # multiple FSDP models
+    model1 = Mock(spec=FullyShardedDataParallel)
+    model1.modules.return_value = [model1]
+    model2 = Mock(spec=FullyShardedDataParallel)
+    model2.modules.return_value = [model2]
+    with pytest.raises(ValueError, match="Found multiple FSDP models in the given state."):
+        strategy.save_checkpoint(path=tmp_path, state={"model1": model1, "model2": model2})
+
+
+def test_load_checkpoint_no_state(tmp_path):
+    """Test that the FSDP strategy can't load the full state without access to a model instance from the user."""
+    strategy = FSDPStrategy()
+    with pytest.raises(ValueError, match=escape("Got FSDPStrategy.load_checkpoint(..., state=None")):
+        strategy.load_checkpoint(path=tmp_path, state=None)
+    with pytest.raises(ValueError, match=escape("Got FSDPStrategy.load_checkpoint(..., state={})")):
+        strategy.load_checkpoint(path=tmp_path, state={})
+
+
+@mock.patch("lightning.fabric.strategies.fsdp.FSDPStrategy.broadcast", lambda _, x: x)
+@mock.patch("lightning.fabric.strategies.fsdp._lazy_load", Mock())
+def test_load_checkpoint_one_fsdp_module_required(tmp_path):
+    """Test that the FSDP strategy can only load one FSDP model per checkpoint."""
+    strategy = FSDPStrategy()
+
+    # missing FSDP model
+    with pytest.raises(ValueError, match="Could not find a FSDP model in the provided checkpoint state."):
+        strategy.load_checkpoint(path=tmp_path, state={"other": "data"})
+    with pytest.raises(ValueError, match="Could not find a FSDP model in the provided checkpoint state."):
+        strategy.load_checkpoint(path=tmp_path, state={"model": torch.nn.Linear(3, 3)})
+
+    # multiple FSDP models
+    model1 = Mock(spec=FullyShardedDataParallel)
+    model1.modules.return_value = [model1]
+    model2 = Mock(spec=FullyShardedDataParallel)
+    model2.modules.return_value = [model2]
+    with pytest.raises(ValueError, match="Found multiple FSDP models in the given state."):
+        strategy.load_checkpoint(path=tmp_path, state={"model1": model1, "model2": model2})
+
+    # A raw nn.Module instead of a dictionary is ok
+    model = Mock(spec=nn.Module)
+    path = tmp_path / "full.ckpt"
+    path.touch()
+    strategy.load_checkpoint(path=path, state=model)
+
+
+@mock.patch("lightning.fabric.strategies.fsdp.FSDPStrategy.broadcast", lambda _, x: x)
+def test_save_checkpoint_unknown_state_dict_type(tmp_path):
+    strategy = FSDPStrategy(state_dict_type="invalid")
+    model = Mock(spec=FullyShardedDataParallel)
+    model.modules.return_value = [model]
+    with pytest.raises(ValueError, match="Unknown state_dict_type"):
+        strategy.save_checkpoint(path=tmp_path, state={"model": model})
+
+
+def test_load_unknown_checkpoint_type(tmp_path):
+    """Test that the strategy validates the contents at the checkpoint path."""
+    strategy = FSDPStrategy()
+    model = Mock(spec=FullyShardedDataParallel)
+    model.modules.return_value = [model]
+    path = tmp_path / "empty_dir"  # neither a single file nor a directory with meta file
+    path.mkdir()
+    with pytest.raises(ValueError, match="does not point to a valid checkpoint"):
+        strategy.load_checkpoint(path=path, state={"model": model})
+
+
+def test_load_raw_checkpoint_validate_single_file(tmp_path):
+    """Test that we validate the given checkpoint is a single file when loading a raw PyTorch state-dict checkpoint."""
+    strategy = FSDPStrategy()
+    model = Mock(spec=nn.Module)
+    path = tmp_path / "folder"
+    path.mkdir()
+    with pytest.raises(ValueError, match="The given path must be a single file containing the full state dict"):
+        strategy.load_checkpoint(path=path, state=model)
+
+
+def test_load_raw_checkpoint_optimizer_unsupported(tmp_path):
+    """Validate that the FSDP strategy does not yet support loading the raw PyTorch state-dict for an optimizer."""
+    strategy = FSDPStrategy()
+    optimizer = Mock(spec=torch.optim.Optimizer)
+    with pytest.raises(
+        NotImplementedError, match="Loading a single optimizer object from a checkpoint is not supported"
+    ):
+        strategy.load_checkpoint(path=tmp_path, state=optimizer)
+
+
+
 @RunIf(min_torch="2.3")
 @mock.patch("lightning.fabric.strategies.ModelParallelStrategy._setup_device_mesh")
 @mock.patch("torch.distributed.init_process_group")
