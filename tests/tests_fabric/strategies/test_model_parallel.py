@@ -256,9 +256,9 @@ def test_load_checkpoint_no_state(tmp_path):
     """Test that the ModelParallelStrategy strategy can't load the full state without access to a model instance
     from the user."""
     strategy = ModelParallelStrategy(parallelize_fn=(lambda m, _: m))
-    with pytest.raises(ValueError, match=escape("Got FSDPStrategy.load_checkpoint(..., state=None")):
+    with pytest.raises(ValueError, match=escape("Got ModelParallelStrategy.load_checkpoint(..., state=None")):
         strategy.load_checkpoint(path=tmp_path, state=None)
-    with pytest.raises(ValueError, match=escape("Got FSDPStrategy.load_checkpoint(..., state={})")):
+    with pytest.raises(ValueError, match=escape("Got ModelParallelStrategy.load_checkpoint(..., state={})")):
         strategy.load_checkpoint(path=tmp_path, state={})
 
 
@@ -290,11 +290,11 @@ def test_load_checkpoint_one_dist_module_required(tmp_path):
     strategy.load_checkpoint(path=path, state=model)
 
 
-def test_load_unknown_checkpoint_type(tmp_path):
+@mock.patch("lightning.fabric.strategies.model_parallel._has_dtensor_modules", return_value=True)
+def test_load_unknown_checkpoint_type(_, tmp_path):
     """Test that the strategy validates the contents at the checkpoint path."""
     strategy = ModelParallelStrategy(parallelize_fn=(lambda m, _: m))
     model = Mock(spec=nn.Module)
-    model.modules.return_value = [model]
     path = tmp_path / "empty_dir"  # neither a single file nor a directory with meta file
     path.mkdir()
     with pytest.raises(ValueError, match="does not point to a valid checkpoint"):

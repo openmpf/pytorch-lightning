@@ -393,7 +393,7 @@ class FSDPStrategy(ParallelStrategy, _Sharded):
             # the root must be wrapped
             raise TypeError(
                 "Gradient clipping with FSDP is only possible if the module passed to"
-                f" `{self.__class__.__name__}.clip_gradients_norm` is wrapped in `FullyShardedDataParallel`."
+                f" `{type(self).__name__}.clip_gradients_norm` is wrapped in `FullyShardedDataParallel`."
                 f" Got: {module.__class__.__name__}."
             )
         self.precision.unscale_gradients(optimizer)
@@ -506,12 +506,7 @@ class FSDPStrategy(ParallelStrategy, _Sharded):
         state: Optional[Union[Module, Optimizer, Dict[str, Union[Module, Optimizer, Any]]]] = None,
         strict: bool = True,
     ) -> Dict[str, Any]:
-        """Load the contents from a checkpoint and restore the state of the given objects.
-
-        The strategy currently only supports saving and loading sharded checkpoints which are stored in form of a
-        directory of multiple files rather than a single file.
-
-        """
+        """Load the contents from a checkpoint and restore the state of the given objects."""
         if not state:
             raise ValueError(
                 f"Got FSDPStrategy.load_checkpoint(..., state={state!r}) but a state with at least "
@@ -755,7 +750,7 @@ class _FSDPBackwardSyncControl(_BackwardSyncControl):
             # the root must be wrapped
             raise TypeError(
                 "Blocking backward sync is only possible if the module passed to"
-                f" `{self.__class__.__name__}.no_backward_sync` is wrapped in `FullyShardedDataParallel`."
+                f" `{type(self).__name__}.no_backward_sync` is wrapped in `FullyShardedDataParallel`."
                 f" Got: {module.__class__.__name__}."
             )
         return module.no_sync()

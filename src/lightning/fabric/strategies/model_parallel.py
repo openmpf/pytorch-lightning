@@ -29,12 +29,14 @@ from lightning.fabric.plugins import CheckpointIO
 from lightning.fabric.plugins.collectives.torch_collective import default_pg_timeout
 from lightning.fabric.strategies.fsdp import (
     _distributed_checkpoint_load,
-    _distributed_checkpoint_save,
-    _is_sharded_checkpoint,
+    _distributed_checkpoint_save, 
+    _is_sharded_checkpoint, 
+    _load_raw_module_state_from_path,
 )
 from lightning.fabric.strategies.launchers.subprocess_script import _SubprocessScriptLauncher
 from lightning.fabric.strategies.parallel import ParallelStrategy
-from lightning.fabric.strategies.strategy import TBroadcast, _BackwardSyncControl, _apply_filter
+from lightning.fabric.strategies.strategy import TBroadcast, _BackwardSyncControl, _apply_filter, \
+    _validate_keys_for_strict_loading
 from lightning.fabric.utilities.distributed import (
     ReduceOp,
     _distributed_is_initialized,
@@ -88,7 +90,7 @@ class ModelParallelStrategy(ParallelStrategy):
     ) -> None:
         super().__init__()
         if not _TORCH_GREATER_EQUAL_2_3:
-            raise ImportError(f"{self.__class__.__name__} requires PyTorch 2.3 or higher.")
+            raise ImportError(f"{type(self).__name__} requires PyTorch 2.3 or higher.")
         self._parallelize_fn = parallelize_fn
         self._data_parallel_size = data_parallel_size
         self._tensor_parallel_size = tensor_parallel_size
@@ -234,13 +236,13 @@ class ModelParallelStrategy(ParallelStrategy):
         """
         if storage_options is not None:
             raise TypeError(
-                f"`{self.__class__.__name__}.save_checkpoint(..., storage_options=...)` is not supported because"
-                f" `{self.__class__.__name__}` does not use the `CheckpointIO`."
+                f"`{type(self).__name__}.save_checkpoint(..., storage_options=...)` is not supported because"
+                f" `{type(self).__name__}` does not use the `CheckpointIO`."
             )
         if filter is not None and self._save_distributed_checkpoint:
             # https://github.com/pytorch/pytorch/issues/105379
             raise NotImplementedError(
-                f"{self.__class__.__name__} doesn't support loading sharded filtered checkpoints, so saving them is disabled."
+                f"{type(self).__name__} doesn't support loading sharded filtered checkpoints, so saving them is disabled."
             )
         # broadcast the path from rank 0 to ensure all the states are saved in a common path
         path = Path(self.broadcast(path))
@@ -259,17 +261,33 @@ class ModelParallelStrategy(ParallelStrategy):
         state: Optional[Union[Module, Optimizer, Dict[str, Union[Module, Optimizer, Any]]]] = None,
         strict: bool = True,
     ) -> Dict[str, Any]:
-        if isinstance(state, (Module, Optimizer)):
-            raise NotImplementedError(
-                "Loading a module or optimizer object from a checkpoint directly is not yet supported."
+        """Load the contents from a checkpoint and restore the state of the given objects."""
+        if not state:
+            raise ValueError(
+                f"Got {type(self).__name__}.load_checkpoint(..., state={state!r}) but a state with at least "
+                " a model instance to reload is required. Pass it in like so:"
+                f" {type(self).__name__}.load_checkpoint(..., state={{'model': model, ...}})"
             )
-        if strict is False:
-            raise NotImplementedError(f"Non-strict loading is not yet supported in {self.__class__.__name__}.")
-
         # broadcast the path from rank 0 to ensure all the states are loaded from a common path
         path = Path(self.broadcast(path))
-        _distributed_checkpoint_load(state, path)  # type: ignore[arg-type]
-        return {}
+
+        if isinstance(state, Module):
+            raise NotImplementedError()  # TODO
+            _load_raw_module_state_from_path(path, module=state, world_size=self.world_size, strict=strict)
+            return {}
+
+        if isinstance(state, Optimizer):
+            raise NotImplementedError(
+                f"Loading a single optimizer object from a checkpoint is not supported yet with"
+                f" {type(self).__name__}."
+            )
+
+        return _load_checkpoint(
+            path=path,
+            state=state,
+            rank=self.global_rank,
+            strict=strict,
+        )
 
     def _setup_distributed(self) -> None:
         reset_seed()
@@ -395,6 +413,104 @@ def _save_checkpoint(
         _distributed_checkpoint_save(converted_state, path)
         if rank == 0:
             torch.save(metadata, path / _METADATA_FILENAME)
+
+
+def _load_checkpoint(
+    path: _PATH,
+    state: Dict[str, Union[Module, Optimizer, Any]],
+    rank: int,
+    strict: bool = True,
+) -> Dict[str, Any]:
+
+    from torch.distributed.checkpoint.state_dict import get_model_state_dict, get_optimizer_state_dict
+    from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
+    from torch.distributed.checkpoint.state_dict import StateDictOptions
+
+    modules = {key: module for key, module in state.items() if _has_dtensor_modules(module)}
+    if len(modules) == 0:
+        raise ValueError(
+            "Could not find a distributed model in the provided checkpoint state. Please provide the model as"
+            " part of the state like so: `load_checkpoint(..., state={'model': model, ...})`. Make sure"
+            " you set up the model (and optimizers if any) through the strategy before loading the checkpoint."
+        )
+    optimizers = {key: optim for key, optim in state.items() if isinstance(optim, Optimizer)}
+    if len(modules) > 1:
+        raise ValueError(
+            f"Found multiple distributed models in the given state. Loading distributed checkpoints is"
+            " currently limited to a single model per checkpoint. To load multiple models, call the"
+            " load method for each model separately with a different path."
+        )
+    module_key, module = list(modules.items())[0]
+
+    if _is_sharded_checkpoint(path):
+        # TODO: Do we need this?
+        state_dict_options = StateDictOptions(cpu_offload=True)
+
+        module_state = {module_key: get_model_state_dict(module)}
+        _distributed_checkpoint_load(module_state, path)
+        module.load_state_dict(module_state[module_key], strict=strict)
+
+        # the optimizer states must be loaded separately
+        for optim_key, optim in optimizers.items():
+            optim_state = {optim_key: get_optimizer_state_dict(module, optim)}
+            _distributed_checkpoint_load(optim_state, path)
+            set_optimizer_state_dict(module, optim, optim_state_dict=optim_state[optim_key])
+
+        # Load metadata (anything not a module or optimizer)
+        metadata = torch.load(path / _METADATA_FILENAME)
+        requested_metadata_keys = state.keys() - modules.keys() - optimizers.keys()
+        _validate_keys_for_strict_loading(requested_metadata_keys, metadata.keys(), strict=strict)
+        for key in requested_metadata_keys:
+            if key not in metadata:
+                continue
+            state[key] = metadata.pop(key)
+
+        # return the remaining metadata that wasn't requested as part of `state`
+        return metadata
+    #
+    # if _is_full_checkpoint(path):
+    #     checkpoint = _lazy_load(path)
+    #     _load_raw_module_state(checkpoint.pop(module_key), module=module, world_size=self.world_size, strict=strict)
+    #
+    #     if isinstance(state, Module):
+    #         return {}
+    #
+    #     # Materialize lazy tensors if there are any left in the checkpoint
+    #     # The `torch.Optimizer.load_state_dict` method can't load lazy tensors because of deepcopy pickle issues
+    #     checkpoint = _materialize_tensors(checkpoint)
+    #
+    #     # Load optimizer states
+    #     for optim_key, optim in optimizers.items():
+    #         # rank0_only should be false because we need to load the optimizer state on all ranks
+    #         with _get_full_state_dict_context(module, world_size=self.world_size, rank0_only=False):
+    #             temp_state_dict = checkpoint.pop(optim_key)
+    #
+    #             # Handling the case where the optimizer state is saved from a normal optimizer
+    #             if isinstance(list(temp_state_dict["state"].keys())[0], int):
+    #                 temp_state_dict = FSDP.rekey_optim_state_dict(
+    #                     temp_state_dict, OptimStateKeyType.PARAM_NAME, module
+    #                 )
+    #
+    #             optim_state_dict = FSDP.optim_state_dict_to_load(
+    #                 optim_state_dict=temp_state_dict,
+    #                 model=module,
+    #                 optim=optim,
+    #             )
+    #             optim.load_state_dict(optim_state_dict)
+    #
+    #     requested_metadata_keys = state.keys() - modules.keys() - optimizers.keys()
+    #     _validate_keys_for_strict_loading(requested_metadata_keys, checkpoint.keys(), strict=strict)
+    #
+    #     # Load metadata (anything not a module or optimizer)
+    #     _move_state_into(source=checkpoint, destination=state, keys=requested_metadata_keys)
+    #
+    #     # return the remaining metadata that wasn't requested as part of `state`
+    #     return checkpoint
+
+    raise ValueError(
+        f"The path {str(path)!r} does not point to a valid checkpoint. Make sure the path points to either a"
+        " directory with FSDP checkpoint shards, or a single file with a full checkpoint."
+    )
 
 
 def _has_dtensor_modules(module: object) -> TypeGuard[Module]:
