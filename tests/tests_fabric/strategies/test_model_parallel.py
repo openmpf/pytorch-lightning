@@ -19,7 +19,6 @@ from unittest.mock import Mock
 import pytest
 import torch
 import torch.nn as nn
-
 from fabric.strategies.fsdp import _is_sharded_checkpoint
 from lightning.fabric.plugins.environments import LightningEnvironment
 from lightning.fabric.strategies import ModelParallelStrategy
@@ -94,7 +93,6 @@ def test_fsdp_v1_modules_unsupported():
 
 
 @RunIf(min_torch="2.3")
-
 def test_parallelize_fn_call():
     model = nn.Linear(2, 2)
     optimizer = Adam(model.parameters())
@@ -229,8 +227,8 @@ def test_save_checkpoint_one_dist_module_required(tmp_path):
 
 
 def test_load_checkpoint_no_state(tmp_path):
-    """Test that the ModelParallelStrategy strategy can't load the full state without access to a model instance
-    from the user."""
+    """Test that the ModelParallelStrategy strategy can't load the full state without access to a model instance from
+    the user."""
     strategy = ModelParallelStrategy(parallelize_fn=(lambda m, _: m))
     with pytest.raises(ValueError, match=escape("Got ModelParallelStrategy.load_checkpoint(..., state=None")):
         strategy.load_checkpoint(path=tmp_path, state=None)
@@ -288,8 +286,8 @@ def test_load_raw_checkpoint_validate_single_file(tmp_path):
 
 
 def test_load_raw_checkpoint_optimizer_unsupported(tmp_path):
-    """Validate that the ModelParallelStrategy strategy does not yet support loading the raw PyTorch state-dict
-    for an optimizer."""
+    """Validate that the ModelParallelStrategy strategy does not yet support loading the raw PyTorch state-dict for an
+    optimizer."""
     strategy = ModelParallelStrategy(parallelize_fn=(lambda m, _: m))
     optimizer = Mock(spec=torch.optim.Optimizer)
     with pytest.raises(

@@ -11,12 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import itertools
 import shutil
 from contextlib import ExitStack
 from datetime import timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, ContextManager, Dict, Literal, Optional, TypeVar, Union, TypeGuard
+from typing import TYPE_CHECKING, Any, Callable, ContextManager, Dict, Literal, Optional, TypeGuard, TypeVar, Union
 
 import torch
 from lightning_utilities.core.rank_zero import rank_zero_only as utils_rank_zero_only
@@ -29,16 +28,20 @@ from lightning.fabric.plugins import CheckpointIO
 from lightning.fabric.plugins.collectives.torch_collective import default_pg_timeout
 from lightning.fabric.strategies.fsdp import (
     _distributed_checkpoint_load,
-    _distributed_checkpoint_save, 
-    _is_sharded_checkpoint, 
-    _load_raw_module_state_from_path,
-    _is_full_checkpoint, 
+    _distributed_checkpoint_save,
     _get_full_state_dict_context,
+    _is_full_checkpoint,
+    _is_sharded_checkpoint,
+    _load_raw_module_state_from_path,
 )
 from lightning.fabric.strategies.launchers.subprocess_script import _SubprocessScriptLauncher
 from lightning.fabric.strategies.parallel import ParallelStrategy
-from lightning.fabric.strategies.strategy import TBroadcast, _BackwardSyncControl, _apply_filter, \
-    _validate_keys_for_strict_loading
+from lightning.fabric.strategies.strategy import (
+    TBroadcast,
+    _apply_filter,
+    _BackwardSyncControl,
+    _validate_keys_for_strict_loading,
+)
 from lightning.fabric.utilities.distributed import (
     ReduceOp,
     _distributed_is_initialized,
@@ -46,10 +49,10 @@ from lightning.fabric.utilities.distributed import (
     _init_dist_connection,
     _sync_ddp_if_available,
 )
-from lightning.fabric.utilities.load import _METADATA_FILENAME, _lazy_load
 from lightning.fabric.utilities.distributed import group as _group
 from lightning.fabric.utilities.imports import _TORCH_GREATER_EQUAL_2_3
 from lightning.fabric.utilities.init import _materialize_distributed_module
+from lightning.fabric.utilities.load import _METADATA_FILENAME, _lazy_load
 from lightning.fabric.utilities.rank_zero import rank_zero_only
 from lightning.fabric.utilities.seed import reset_seed
 from lightning.fabric.utilities.types import _PATH, _Stateful
@@ -79,6 +82,7 @@ class ModelParallelStrategy(ParallelStrategy):
         save_distributed_checkpoint: If ``True``, each rank saves its shard of weights and optimizer states to a file.
             The checkpoint is a folder with as many files as the world size.
             If ``False``, the full weights and optimizer states get assembled on rank 0 and saved to a single file.
+
     """
 
     def __init__(
@@ -379,8 +383,7 @@ def _save_checkpoint(
         )
     module = modules[0]
 
-    from torch.distributed.checkpoint.state_dict import StateDictOptions
-    from torch.distributed.checkpoint.state_dict import get_model_state_dict, get_optimizer_state_dict
+    from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict, get_optimizer_state_dict
 
     state_dict_options = StateDictOptions(full_state_dict=full_state_dict, cpu_offload=True)
 
@@ -422,10 +425,12 @@ def _load_checkpoint(
     rank: int,
     strict: bool = True,
 ) -> Dict[str, Any]:
-
-    from torch.distributed.checkpoint.state_dict import get_model_state_dict, get_optimizer_state_dict
-    from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
-    from torch.distributed.checkpoint.state_dict import StateDictOptions
+    from torch.distributed.checkpoint.state_dict import (
+        StateDictOptions,
+        get_model_state_dict,
+        get_optimizer_state_dict,
+        set_optimizer_state_dict,
+    )
 
     modules = {key: module for key, module in state.items() if _has_dtensor_modules(module)}
     if len(modules) == 0:
@@ -437,7 +442,7 @@ def _load_checkpoint(
     optimizers = {key: optim for key, optim in state.items() if isinstance(optim, Optimizer)}
     if len(modules) > 1:
         raise ValueError(
-            f"Found multiple distributed models in the given state. Loading distributed checkpoints is"
+            "Found multiple distributed models in the given state. Loading distributed checkpoints is"
             " currently limited to a single model per checkpoint. To load multiple models, call the"
             " load method for each model separately with a different path."
         )
