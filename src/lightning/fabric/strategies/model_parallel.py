@@ -52,7 +52,7 @@ from lightning.fabric.utilities.distributed import (
 from lightning.fabric.utilities.distributed import group as _group
 from lightning.fabric.utilities.imports import _TORCH_GREATER_EQUAL_2_3
 from lightning.fabric.utilities.init import _materialize_distributed_module
-from lightning.fabric.utilities.load import _METADATA_FILENAME, _lazy_load
+from lightning.fabric.utilities.load import _METADATA_FILENAME, _lazy_load, _move_state_into
 from lightning.fabric.utilities.rank_zero import rank_zero_only
 from lightning.fabric.utilities.seed import reset_seed
 from lightning.fabric.utilities.types import _PATH, _Stateful
@@ -473,45 +473,31 @@ def _load_checkpoint(
 
         # return the remaining metadata that wasn't requested as part of `state`
         return metadata
-    #
-    # if _is_full_checkpoint(path):
-    #     checkpoint = _lazy_load(path)
-    #     _load_raw_module_state(checkpoint.pop(module_key), module=module, world_size=self.world_size, strict=strict)
-    #
-    #     if isinstance(state, Module):
-    #         return {}
-    #
-    #     # Materialize lazy tensors if there are any left in the checkpoint
-    #     # The `torch.Optimizer.load_state_dict` method can't load lazy tensors because of deepcopy pickle issues
-    #     checkpoint = _materialize_tensors(checkpoint)
-    #
-    #     # Load optimizer states
-    #     for optim_key, optim in optimizers.items():
-    #         # rank0_only should be false because we need to load the optimizer state on all ranks
-    #         with _get_full_state_dict_context(module, world_size=self.world_size, rank0_only=False):
-    #             temp_state_dict = checkpoint.pop(optim_key)
-    #
-    #             # Handling the case where the optimizer state is saved from a normal optimizer
-    #             if isinstance(list(temp_state_dict["state"].keys())[0], int):
-    #                 temp_state_dict = FSDP.rekey_optim_state_dict(
-    #                     temp_state_dict, OptimStateKeyType.PARAM_NAME, module
-    #                 )
-    #
-    #             optim_state_dict = FSDP.optim_state_dict_to_load(
-    #                 optim_state_dict=temp_state_dict,
-    #                 model=module,
-    #                 optim=optim,
-    #             )
-    #             optim.load_state_dict(optim_state_dict)
-    #
-    #     requested_metadata_keys = state.keys() - modules.keys() - optimizers.keys()
-    #     _validate_keys_for_strict_loading(requested_metadata_keys, checkpoint.keys(), strict=strict)
-    #
-    #     # Load metadata (anything not a module or optimizer)
-    #     _move_state_into(source=checkpoint, destination=state, keys=requested_metadata_keys)
-    #
-    #     # return the remaining metadata that wasn't requested as part of `state`
-    #     return checkpoint
+
+    if _is_full_checkpoint(path):
+        checkpoint = _lazy_load(path)
+        _load_raw_module_state(checkpoint.pop(module_key), module=module, world_size=1, strict=strict)
+
+        if isinstance(state, Module):
+            return {}
+
+        # Materialize lazy tensors if there are any left in the checkpoint
+        # The `torch.Optimizer.load_state_dict` method can't load lazy tensors because of deepcopy pickle issues
+        # checkpoint = _materialize_tensors(checkpoint)  # TODO
+
+        # Load optimizer states
+        for optim_key, optim in optimizers.items():
+            optim_state = checkpoint.pop(optim_key)
+            set_optimizer_state_dict(module, optim, optim_state_dict=optim_state)  # options=state_dict_options TODO
+
+        requested_metadata_keys = state.keys() - modules.keys() - optimizers.keys()
+        _validate_keys_for_strict_loading(requested_metadata_keys, checkpoint.keys(), strict=strict)
+
+        # Load metadata (anything not a module or optimizer)
+        _move_state_into(source=checkpoint, destination=state, keys=requested_metadata_keys)
+
+        # return the remaining metadata that wasn't requested as part of `state`
+        return checkpoint
 
     raise ValueError(
         f"The path {str(path)!r} does not point to a valid checkpoint. Make sure the path points to either a"
