@@ -206,6 +206,7 @@ def test_save_checkpoint_path_exists(shutil_mock, torch_save_mock, _, __, ___, t
     assert path.is_dir()
 
 
+@RunIf(min_torch="2.3")
 def test_save_checkpoint_one_dist_module_required(tmp_path):
     """Test that the ModelParallelStrategy strategy can only save one distributed model per checkpoint."""
     strategy = ModelParallelStrategy(parallelize_fn=(lambda m, _: m))
@@ -226,6 +227,7 @@ def test_save_checkpoint_one_dist_module_required(tmp_path):
             strategy.save_checkpoint(path=tmp_path, state={"model1": model1, "model2": model2})
 
 
+@RunIf(min_torch="2.3")
 def test_load_checkpoint_no_state(tmp_path):
     """Test that the ModelParallelStrategy strategy can't load the full state without access to a model instance from
     the user."""
@@ -236,6 +238,7 @@ def test_load_checkpoint_no_state(tmp_path):
         strategy.load_checkpoint(path=tmp_path, state={})
 
 
+@RunIf(min_torch="2.3")
 @mock.patch("lightning.fabric.strategies.model_parallel.ModelParallelStrategy.broadcast", lambda _, x: x)
 @mock.patch("lightning.fabric.strategies.fsdp._lazy_load", Mock())
 def test_load_checkpoint_one_dist_module_required(tmp_path):
@@ -264,17 +267,19 @@ def test_load_checkpoint_one_dist_module_required(tmp_path):
     strategy.load_checkpoint(path=path, state=model)
 
 
+@RunIf(min_torch="2.3")
 @mock.patch("lightning.fabric.strategies.model_parallel._has_dtensor_modules", return_value=True)
 def test_load_unknown_checkpoint_type(_, tmp_path):
     """Test that the strategy validates the contents at the checkpoint path."""
     strategy = ModelParallelStrategy(parallelize_fn=(lambda m, _: m))
-    model = Mock(spec=nn.Module)
+    model = Mock()
     path = tmp_path / "empty_dir"  # neither a single file nor a directory with meta file
     path.mkdir()
     with pytest.raises(ValueError, match="does not point to a valid checkpoint"):
         strategy.load_checkpoint(path=path, state={"model": model})
 
 
+@RunIf(min_torch="2.3")
 def test_load_raw_checkpoint_validate_single_file(tmp_path):
     """Test that we validate the given checkpoint is a single file when loading a raw PyTorch state-dict checkpoint."""
     strategy = ModelParallelStrategy(parallelize_fn=(lambda m, _: m))
@@ -285,6 +290,7 @@ def test_load_raw_checkpoint_validate_single_file(tmp_path):
         strategy.load_checkpoint(path=path, state=model)
 
 
+@RunIf(min_torch="2.3")
 def test_load_raw_checkpoint_optimizer_unsupported(tmp_path):
     """Validate that the ModelParallelStrategy strategy does not yet support loading the raw PyTorch state-dict for an
     optimizer."""
