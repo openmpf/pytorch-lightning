@@ -15,7 +15,8 @@ import shutil
 from contextlib import ExitStack
 from datetime import timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, ContextManager, Dict, Literal, Optional, TypeGuard, TypeVar, Union
+from typing import TYPE_CHECKING, Any, Callable, ContextManager, Dict, Literal, Optional, TypeVar, Union
+from typing_extensions import TypeGuard
 
 import torch
 from lightning_utilities.core.rank_zero import rank_zero_only as utils_rank_zero_only
