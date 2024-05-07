@@ -312,7 +312,7 @@ def test_load_checkpoint_no_state(tmp_path):
 
 
 @mock.patch("lightning.fabric.strategies.fsdp.FSDPStrategy.broadcast", lambda _, x: x)
-@mock.patch("lightning.fabric.strategies.fsdp._lazy_load", Mock())
+@mock.patch("lightning.fabric.strategies.model_parallel._lazy_load", Mock())
 def test_load_checkpoint_one_fsdp_module_required(tmp_path):
     """Test that the FSDP strategy can only load one FSDP model per checkpoint."""
     strategy = FSDPStrategy()
@@ -333,6 +333,7 @@ def test_load_checkpoint_one_fsdp_module_required(tmp_path):
 
     # A raw nn.Module instead of a dictionary is ok
     model = Mock(spec=nn.Module)
+    model.parameters.return_value = [torch.zeros(2, 1)]
     path = tmp_path / "full.ckpt"
     path.touch()
     strategy.load_checkpoint(path=path, state=model)

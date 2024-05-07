@@ -424,6 +424,7 @@ def _load_checkpoint(
     rank: int,
     strict: bool = True,
 ) -> Dict[str, Any]:
+
     from torch.distributed.checkpoint.state_dict import (
         StateDictOptions,
         get_model_state_dict,

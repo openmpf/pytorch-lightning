@@ -240,7 +240,7 @@ def test_load_checkpoint_no_state(tmp_path):
 
 @RunIf(min_torch="2.3")
 @mock.patch("lightning.fabric.strategies.model_parallel.ModelParallelStrategy.broadcast", lambda _, x: x)
-@mock.patch("lightning.fabric.strategies.fsdp._lazy_load", Mock())
+@mock.patch("lightning.fabric.strategies.model_parallel._lazy_load", Mock())
 def test_load_checkpoint_one_dist_module_required(tmp_path):
     """Test that the ModelParallelStrategy strategy can only load one distributed model per checkpoint."""
     strategy = ModelParallelStrategy(parallelize_fn=(lambda m, _: m))
@@ -262,6 +262,7 @@ def test_load_checkpoint_one_dist_module_required(tmp_path):
 
     # A raw nn.Module instead of a dictionary is ok
     model = Mock(spec=nn.Module)
+    model.parameters.return_value = [torch.zeros(2, 1)]
     path = tmp_path / "full.ckpt"
     path.touch()
     strategy.load_checkpoint(path=path, state=model)
