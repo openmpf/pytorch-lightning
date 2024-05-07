@@ -16,14 +16,13 @@ from contextlib import ExitStack
 from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, ContextManager, Dict, Literal, Optional, TypeVar, Union
-from typing_extensions import TypeGuard
 
 import torch
 from lightning_utilities.core.rank_zero import rank_zero_only as utils_rank_zero_only
 from torch import Tensor
 from torch.nn import Module
 from torch.optim import Optimizer
-from typing_extensions import override
+from typing_extensions import TypeGuard, override
 
 from lightning.fabric.plugins import CheckpointIO
 from lightning.fabric.plugins.collectives.torch_collective import default_pg_timeout
