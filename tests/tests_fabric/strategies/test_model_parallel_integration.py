@@ -215,6 +215,24 @@ def test_fsdp2_tensor_parallel():
         optimizer.zero_grad()
 
 
+def _train(fabric, model=None, optimizer=None):
+    fabric.seed_everything(0)
+
+    if model is None:
+        with fabric.init_module(empty_init=True):
+            model = FeedForward()
+        model = fabric.setup(model)
+    if optimizer is None:
+        optimizer = torch.optim.AdamW(model.parameters())
+        optimizer = fabric.setup_optimizers(optimizer)
+
+    output = model(torch.rand(2, 32, device=fabric.device))
+    fabric.backward(output.sum())
+    optimizer.step()
+    optimizer.zero_grad()
+    return model, optimizer
+
+
 @RunIf(min_torch="2.3", min_cuda_gpus=4, standalone=True)
 @pytest.mark.parametrize(
     "precision",
@@ -234,17 +252,7 @@ def test_train_save_load(precision, tmp_path):
     )
     fabric = Fabric(accelerator="cuda", devices=4, strategy=strategy, precision=precision)
     fabric.launch()
-
-    fabric.seed_everything(0)
-    with fabric.init_module(empty_init=True):
-        model = FeedForward()
-    model = fabric.setup(model)
-    optimizer = torch.optim.AdamW(model.parameters())
-    optimizer = fabric.setup_optimizers(optimizer)
-    output = model(torch.rand(2, 32, device=fabric.device))
-    fabric.backward(output.sum())
-    optimizer.step()
-    optimizer.zero_grad()
+    model, optimizer = _train(fabric)
 
     checkpoint_path = fabric.broadcast(str(tmp_path / "dist-checkpoint"))
 
@@ -267,17 +275,7 @@ def test_train_save_load(precision, tmp_path):
     )
     fabric = Fabric(accelerator="cuda", devices=4, strategy=strategy, precision=precision)
     fabric.launch()
-
-    fabric.seed_everything(0)
-    with fabric.init_module(empty_init=True):
-        model = FeedForward()
-    model = fabric.setup(model)
-    optimizer = torch.optim.AdamW(model.parameters())
-    optimizer = fabric.setup_optimizers(optimizer)
-    output = model(torch.rand(2, 32, device=fabric.device))
-    fabric.backward(output.sum())
-    optimizer.step()
-    optimizer.zero_grad()
+    model, optimizer = _train(fabric)
 
     # check correctness with loaded state
     state = {"model": model, "optimizer": optimizer, "steps": 0}
@@ -288,8 +286,6 @@ def test_train_save_load(precision, tmp_path):
     # check user data in state reloaded
     assert state["steps"] == 1
     assert not metadata
-
-    # TODO: Test strict and non-strict loading here once supported
 
     # attempt to load a key not in the metadata checkpoint
     state = {"model": model, "coconut": 11}
@@ -302,21 +298,23 @@ def test_train_save_load(precision, tmp_path):
     assert state["coconut"] == 11
 
 
-@RunIf(min_cuda_gpus=2, standalone=True)
+@RunIf(min_torch="2.3", min_cuda_gpus=2, standalone=True)
 def test_save_full_state_dict(tmp_path):
     """Test that FSDP saves the full state into a single file with `state_dict_type="full"`."""
-    fabric = Fabric(
-        accelerator="cuda",
-        strategy=FSDPStrategy(auto_wrap_policy=always_wrap_policy, state_dict_type="full"),
-        devices=2,
+    from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
+
+    strategy = ModelParallelStrategy(
+        _parallelize_feed_forward_fsdp2,
+        data_parallel_size=2,
+        tensor_parallel_size=1,
+        save_distributed_checkpoint=False,
     )
+    fabric = Fabric(accelerator="cuda", strategy=strategy, devices=2)
     fabric.launch()
-    trainer = BasicTrainer(fabric)
-    trainer.run()
+    model, optimizer = _train(fabric)
 
     checkpoint_path = Path(fabric.broadcast(str(tmp_path / "fsdp-checkpoint.pt")))
-
-    state = {"model": trainer.model, "optimizer": trainer.optimizer, "steps": 1}
+    state = {"model": model, "optimizer": optimizer, "steps": 1}
     fabric.save(checkpoint_path, state)
 
     checkpoint = torch.load(checkpoint_path)
@@ -324,96 +322,81 @@ def test_save_full_state_dict(tmp_path):
     loaded_state_dict = checkpoint["model"]
 
     # assert the correct state model was saved
-    with FullyShardedDataParallel.summon_full_params(trainer.model):
-        state_dict = trainer.model.state_dict()
-        assert set(loaded_state_dict.keys()) == set(state_dict.keys())
-        for param_name in state_dict:
-            assert torch.equal(loaded_state_dict[param_name], state_dict[param_name].cpu())
-        params_before = [p.cpu() for p in trainer.model.parameters()]
+    state_dict = model.state_dict()
+    assert set(loaded_state_dict.keys()) == set(state_dict.keys())
+    for param_name in state_dict:
+        assert torch.equal(loaded_state_dict[param_name], state_dict[param_name].full_tensor().cpu())
+    params_before = [p.cpu() for p in model.parameters()]
 
     # assert the correct optimizer state was saved
-    optimizer_state_before = FullyShardedDataParallel.full_optim_state_dict(
-        trainer.model, trainer.optimizer, rank0_only=False
-    )
+    optimizer_state_before = get_optimizer_state_dict(model, optimizer)
     assert set(checkpoint["optimizer"].keys()) == set(optimizer_state_before.keys()) == {"state", "param_groups"}
 
     # 1. verify the FSDP state can be loaded back into a FSDP model/strategy directly
-    fabric = Fabric(
-        accelerator="cuda",
-        strategy=FSDPStrategy(auto_wrap_policy=always_wrap_policy),
-        devices=2,
-    )
+    strategy = ModelParallelStrategy(_parallelize_feed_forward_fsdp2, data_parallel_size=2, tensor_parallel_size=1)
+    fabric = Fabric(accelerator="cuda", strategy=strategy, devices=2)
     fabric.launch()
-    trainer = BasicTrainer(fabric)
-    trainer.run()
-    metadata = fabric.load(checkpoint_path, {"model": trainer.model, "optimizer": trainer.optimizer})
+    model, optimizer = _train(fabric)
+
+    metadata = fabric.load(checkpoint_path, {"model": model, "optimizer": optimizer})
     assert metadata == {"steps": 1}
 
-    with FullyShardedDataParallel.summon_full_params(trainer.model):
-        params_after = list(trainer.model.parameters())
-        assert all(torch.equal(p0.cpu(), p1.cpu()) for p0, p1 in zip(params_before, params_after))
+    params_after = list(p.full_tensor() for p in model.parameters())
+    assert all(torch.equal(p0.cpu(), p1.cpu()) for p0, p1 in zip(params_before, params_after))
 
     # assert the correct optimizer state was loaded
-    optimizer_state_after = FullyShardedDataParallel.full_optim_state_dict(
-        trainer.model, trainer.optimizer, rank0_only=False
-    )
+    optimizer_state_after = get_optimizer_state_dict(model, optimizer)
     assert set(optimizer_state_after.keys()) == set(optimizer_state_before.keys()) == {"state", "param_groups"}
     torch.testing.assert_close(optimizer_state_after["state"], optimizer_state_before["state"], atol=0, rtol=0)
     assert optimizer_state_after["param_groups"] == optimizer_state_before["param_groups"]
 
     # run a step to verify the optimizer state is correct
-    trainer.run()
+    _train(fabric, model, optimizer)
 
     # 2. verify the FSDP state can be loaded back into a single-device model/strategy
     fabric = Fabric(accelerator="cpu", devices=1)
-    trainer = BasicTrainer(fabric)
-    trainer.run()
-    metadata = fabric.load(checkpoint_path, {"model": trainer.model, "optimizer": trainer.optimizer})
+    model, optimizer = _train(fabric)
+    metadata = fabric.load(checkpoint_path, {"model": model, "optimizer": optimizer})
     assert metadata == {"steps": 1}
-    params_after = list(trainer.model.parameters())
+    params_after = list(model.parameters())
     assert all(torch.equal(p0, p1) for p0, p1 in zip(params_before, params_after))
 
     # get optimizer state after loading
     normal_checkpoint_path = Path(fabric.broadcast(str(tmp_path / "normal-checkpoint.pt")))
-    fabric.save(normal_checkpoint_path, {"model": trainer.model, "optimizer": trainer.optimizer, "steps": 2})
+    fabric.save(normal_checkpoint_path, {"model": model, "optimizer": optimizer, "steps": 2})
     optimizer_state_after = torch.load(normal_checkpoint_path)["optimizer"]
-    optimizer_state_after = FullyShardedDataParallel.rekey_optim_state_dict(
-        optimizer_state_after, optim_state_key_type=OptimStateKeyType.PARAM_NAME, model=trainer.model
-    )
+
+    # TODO: needed?
+    # optimizer_state_after = FullyShardedDataParallel.rekey_optim_state_dict(
+    #     optimizer_state_after, optim_state_key_type=OptimStateKeyType.PARAM_NAME, model=trainer.model
+    # )
 
     # assert the correct optimizer state was loaded
     assert set(optimizer_state_after.keys()) == set(optimizer_state_before.keys()) == {"state", "param_groups"}
     torch.testing.assert_close(optimizer_state_after["state"], optimizer_state_before["state"], atol=0, rtol=0)
 
     # run a step to verify the optimizer state is correct
-    trainer.run()
+    _train(fabric, model, optimizer)
 
     # 3. verify that a single-device model/strategy states can be loaded into a FSDP model/strategy
-    fabric = Fabric(
-        accelerator="cuda",
-        strategy=FSDPStrategy(auto_wrap_policy=always_wrap_policy),
-        devices=2,
-    )
+    strategy = ModelParallelStrategy(_parallelize_feed_forward_fsdp2, data_parallel_size=2, tensor_parallel_size=1)
+    fabric = Fabric(accelerator="cuda", strategy=strategy, devices=2)
     fabric.launch()
-    trainer = BasicTrainer(fabric)
-    trainer.run()
-    metadata = fabric.load(normal_checkpoint_path, {"model": trainer.model, "optimizer": trainer.optimizer})
+    model, optimizer = _train(fabric)
+    metadata = fabric.load(normal_checkpoint_path, {"model": model, "optimizer": optimizer})
     assert metadata == {"steps": 2}
 
-    with FullyShardedDataParallel.summon_full_params(trainer.model):
-        params_after = list(trainer.model.parameters())
-        assert all(torch.equal(p0.cpu(), p1.cpu()) for p0, p1 in zip(params_before, params_after))
+    params_after = list(p.full_tensor() for p in model.parameters())
+    assert all(torch.equal(p0.cpu(), p1.cpu()) for p0, p1 in zip(params_before, params_after))
 
     # assert the correct optimizer state was loaded
-    optimizer_state_after = FullyShardedDataParallel.full_optim_state_dict(
-        trainer.model, trainer.optimizer, rank0_only=False
-    )
+    optimizer_state_after = get_optimizer_state_dict(model, optimizer)
     assert set(optimizer_state_after.keys()) == set(optimizer_state_before.keys()) == {"state", "param_groups"}
     torch.testing.assert_close(optimizer_state_after["state"], optimizer_state_before["state"], atol=0, rtol=0)
     assert optimizer_state_after["param_groups"] == optimizer_state_before["param_groups"]
 
     # run a step to verify the optimizer state is correct
-    trainer.run()
+    _train(fabric, model, optimizer)
 
 
 @RunIf(min_cuda_gpus=2, standalone=True)
