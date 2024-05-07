@@ -19,7 +19,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 import torch.nn as nn
-from fabric.strategies.fsdp import _is_sharded_checkpoint
+from lightning.fabric.strategies.fsdp import _is_sharded_checkpoint
 from lightning.fabric.plugins.environments import LightningEnvironment
 from lightning.fabric.strategies import ModelParallelStrategy
 from lightning.fabric.strategies.model_parallel import _ParallelBackwardSyncControl
