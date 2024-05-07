@@ -301,7 +301,8 @@ def test_train_save_load(precision, tmp_path):
 
 @RunIf(min_torch="2.3", min_cuda_gpus=2, standalone=True)
 def test_save_full_state_dict(tmp_path):
-    """Test that ModelParallelStrategy saves the full state into a single file with `save_distributed_checkpoint=False`."""
+    """Test that ModelParallelStrategy saves the full state into a single file with
+    `save_distributed_checkpoint=False`."""
     from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
 
     strategy = ModelParallelStrategy(
@@ -402,40 +403,31 @@ def test_save_full_state_dict(tmp_path):
 
 @RunIf(min_cuda_gpus=2, standalone=True)
 def test_load_full_state_dict_into_sharded_model(tmp_path):
-    """Test that the strategy can load a full-state checkpoint into a FSDP sharded model."""
-    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-
+    """Test that the strategy can load a full-state checkpoint into a distributed model."""
     fabric = Fabric(accelerator="cuda", devices=1)
     fabric.seed_everything(0)
-    trainer = BasicTrainer(fabric)
-    trainer.run()
+    model, optimizer = _train(fabric)
 
     # Save a full-state-dict checkpoint
     checkpoint_path = Path(fabric.broadcast(str(tmp_path / "full-checkpoint.pt")))
-    state = {"model": trainer.model, "optimizer": trainer.optimizer, "steps": 1}
+    state = {"model": model, "optimizer": optimizer, "steps": 1}
     fabric.save(checkpoint_path, state)
 
     # Gather all weights and store a copy manually
-    with FSDP.summon_full_params(trainer.model, writeback=False, rank0_only=False):
-        params_before = torch.cat([p.cpu().view(-1) for p in trainer.model.parameters()])
+    params_before = torch.cat([p.full_tensor().cpu().view(-1) for p in model.parameters()])
 
     # Create a FSDP sharded model
-    fabric = Fabric(
-        accelerator="cuda",
-        strategy=FSDPStrategy(auto_wrap_policy=always_wrap_policy),
-        devices=2,
-    )
+    strategy = ModelParallelStrategy(_parallelize_feed_forward_fsdp2, data_parallel_size=2, tensor_parallel_size=1)
+    fabric = Fabric(accelerator="cuda", strategy=strategy, devices=2)
     fabric.launch()
-    trainer = BasicTrainer(fabric)
-    trainer.run()
+    model, optimizer = _train(fabric)
 
-    state = {"model": trainer.model, "optimizer": trainer.optimizer, "steps": 44}
+    state = {"model": model, "optimizer": optimizer, "steps": 44}
     fabric.load(checkpoint_path, state)
     assert state["steps"] == 1
 
     # Gather all weights and compare
-    with FSDP.summon_full_params(trainer.model, writeback=False, rank0_only=False):
-        params_after = torch.cat([p.cpu().view(-1) for p in trainer.model.parameters()])
+    params_after = torch.cat([p.full_tensor().cpu().view(-1) for p in model.parameters()])
     assert torch.equal(params_before, params_after)
 
     # Create a raw state-dict checkpoint to test `Fabric.load_raw` too
@@ -445,12 +437,11 @@ def test_load_full_state_dict_into_sharded_model(tmp_path):
         torch.save(checkpoint["model"], raw_checkpoint_path)
     fabric.barrier()
 
-    trainer.run()
-    fabric.load_raw(raw_checkpoint_path, trainer.model)
+    _train(fabric, model, optimizer)
+    fabric.load_raw(raw_checkpoint_path, model)
 
     # Gather all weights and compare
-    with FSDP.summon_full_params(trainer.model, writeback=False, rank0_only=False):
-        params_after = torch.cat([p.cpu().view(-1) for p in trainer.model.parameters()])
+    params_after = torch.cat([p.full_tensor().cpu().view(-1) for p in model.parameters()])
     assert torch.equal(params_before, params_after)
 
 
