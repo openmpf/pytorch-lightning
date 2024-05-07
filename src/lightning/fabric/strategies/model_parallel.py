@@ -247,7 +247,7 @@ class ModelParallelStrategy(ParallelStrategy):
         _save_checkpoint(
             path=path,
             state=state,
-            full_state_dict=self._save_distributed_checkpoint,
+            full_state_dict=(not self._save_distributed_checkpoint),
             rank=self.global_rank,
             filter=filter,
         )
@@ -345,16 +345,16 @@ def _save_checkpoint(
     if path.is_dir() and full_state_dict and not _is_sharded_checkpoint(path):
         raise IsADirectoryError(f"The checkpoint path exists and is a directory: {path}")
 
-    modules = [module for module in state.values() if _has_fsdp2_modules(module)]
+    modules = [module for module in state.values() if _has_dtensor_modules(module)]
     if len(modules) == 0:
         raise ValueError(
-            "Could not find a FSDP model in the provided checkpoint state. Please provide the model as"
+            "Could not find a distributed model in the provided checkpoint state. Please provide the model as"
             " part of the state like so: `save_checkpoint(..., state={'model': model, ...})`. Make sure"
             " you set up the model (and optimizers if any) through the strategy before saving the checkpoint."
         )
     if len(modules) > 1:
         raise ValueError(
-            "Found multiple FSDP models in the given state. Saving checkpoints with FSDP is"
+            "Found multiple distributed models in the given state. Saving distributed checkpoints is"
             " currently limited to a single model per checkpoint. To save multiple models, call the"
             " save method for each model separately with a different path."
         )
@@ -397,8 +397,7 @@ def _save_checkpoint(
             torch.save(metadata, path / _METADATA_FILENAME)
 
 
-def _has_fsdp2_modules(module: object) -> TypeGuard[Module]:
-    # TODO: in 2.4 nightly, this was renamed FSDPModule
-    from torch.distributed._composable.fsdp.fully_shard import FSDP as FSDPModule
+def _has_dtensor_modules(module: object) -> TypeGuard[Module]:
+    from torch.distributed._tensor import DTensor
 
-    return isinstance(module, Module) and any(isinstance(m, FSDPModule) for m in module.modules())
+    return isinstance(module, Module) and any(isinstance(t, DTensor) for t in module.parameters())

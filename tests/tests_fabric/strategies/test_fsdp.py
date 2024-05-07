@@ -283,7 +283,6 @@ def test_save_checkpoint_path_exists(shutil_mock, torch_save_mock, __, ___, tmp_
     assert path.is_dir()
 
 
-@mock.patch("lightning.fabric.strategies.fsdp.FSDPStrategy.broadcast", lambda _, x: x)
 def test_save_checkpoint_one_fsdp_module_required(tmp_path):
     """Test that the FSDP strategy can only save one FSDP model per checkpoint."""
     strategy = FSDPStrategy()
@@ -292,7 +291,7 @@ def test_save_checkpoint_one_fsdp_module_required(tmp_path):
     with pytest.raises(ValueError, match="Could not find a FSDP model in the provided checkpoint state."):
         strategy.save_checkpoint(path=tmp_path, state={})
     with pytest.raises(ValueError, match="Could not find a FSDP model in the provided checkpoint state."):
-        strategy.load_checkpoint(path=tmp_path, state={"model": torch.nn.Linear(3, 3)})
+        strategy.save_checkpoint(path=tmp_path, state={"model": torch.nn.Linear(3, 3)})
 
     # multiple FSDP models
     model1 = Mock(spec=FullyShardedDataParallel)
