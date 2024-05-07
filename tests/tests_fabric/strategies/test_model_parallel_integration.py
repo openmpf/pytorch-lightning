@@ -265,6 +265,7 @@ def test_train_save_load(precision, tmp_path):
         "__1_0.distcp",
         "__2_0.distcp",
         "__3_0.distcp",
+        "meta.pt",
     }
 
     # re-init all objects and resume
@@ -300,7 +301,7 @@ def test_train_save_load(precision, tmp_path):
 
 @RunIf(min_torch="2.3", min_cuda_gpus=2, standalone=True)
 def test_save_full_state_dict(tmp_path):
-    """Test that FSDP saves the full state into a single file with `state_dict_type="full"`."""
+    """Test that ModelParallelStrategy saves the full state into a single file with `save_distributed_checkpoint=False`."""
     from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
 
     strategy = ModelParallelStrategy(
