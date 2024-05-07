@@ -517,6 +517,8 @@ class FSDPStrategy(ParallelStrategy, _Sharded):
         path = Path(self.broadcast(path))
 
         if isinstance(state, Module):
+            from lightning.fabric.strategies.model_parallel import _load_raw_module_state_from_path
+
             _load_raw_module_state_from_path(path, module=state, world_size=self.world_size, strict=strict)
             return {}
 
@@ -587,6 +589,9 @@ class FSDPStrategy(ParallelStrategy, _Sharded):
 
         if _is_full_checkpoint(path):
             checkpoint = _lazy_load(path)
+
+            from lightning.fabric.strategies.model_parallel import _load_raw_module_state
+
             _load_raw_module_state(checkpoint.pop(module_key), module=module, world_size=self.world_size, strict=strict)
 
             if isinstance(state, Module):
@@ -841,28 +846,6 @@ def _has_fsdp_modules(module: object) -> TypeGuard[Module]:
     from torch.distributed.fsdp import FullyShardedDataParallel
 
     return isinstance(module, Module) and any(isinstance(m, FullyShardedDataParallel) for m in module.modules())
-
-
-def _load_raw_module_state_from_path(path: Path, module: Module, world_size: int, strict: bool = True) -> None:
-    """Loads the state dict from a file path into the FSDP module."""
-    if not _is_full_checkpoint(path):
-        raise ValueError(
-            "Failed to load checkpoint directly into the model. The given path must be a single file containing the"
-            f" full state dict: {path}"
-        )
-    # Use `lazy_load` instead of `torch.load` here to avoid storing a copy of the full checkpoint per rank
-    _load_raw_module_state(state_dict=_lazy_load(path), module=module, world_size=world_size, strict=strict)
-
-
-def _load_raw_module_state(state_dict: Dict[str, Any], module: Module, world_size: int, strict: bool = True) -> None:
-    """Loads the state dict into the module by gathering all weights first and then and writing back to each shard."""
-    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-
-    if not isinstance(module, FSDP):
-        module.load_state_dict(state_dict, strict=strict)
-    else:
-        with _get_full_state_dict_context(module, world_size=world_size, rank0_only=False):
-            module.load_state_dict(state_dict, strict=strict)
 
 
 def _move_torchmetrics_to_device(module: torch.nn.Module, device: torch.device) -> None:

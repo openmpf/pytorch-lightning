@@ -83,31 +83,6 @@ def test_checkpoint_io_unsupported():
 
 
 @RunIf(min_torch="2.3")
-def test_save_filter_unsupported(tmp_path):
-    strategy = ModelParallelStrategy(parallelize_fn=(lambda m, _: m))
-    with pytest.raises(NotImplementedError, match="does not yet support the `filter` argument"):
-        strategy.save_checkpoint(tmp_path / "checkpoint.pth", state={}, filter=Mock())
-
-
-@RunIf(min_torch="2.3")
-def test_load_raw_unsupported(tmp_path):
-    strategy = ModelParallelStrategy(parallelize_fn=(lambda m, _: m))
-    model = nn.Linear(2, 2)
-    optimizer = Adam(model.parameters())
-    with pytest.raises(NotImplementedError, match="object from a checkpoint directly is not yet supported"):
-        strategy.load_checkpoint(tmp_path / "checkpoint.pth", state=model)
-    with pytest.raises(NotImplementedError, match="object from a checkpoint directly is not yet supported"):
-        strategy.load_checkpoint(tmp_path / "checkpoint.pth", state=optimizer)
-
-
-@RunIf(min_torch="2.3")
-def test_load_non_strict_unsupported(tmp_path):
-    strategy = ModelParallelStrategy(parallelize_fn=(lambda m, _: m))
-    with pytest.raises(NotImplementedError, match="Non-strict loading is not yet supported"):
-        strategy.load_checkpoint(tmp_path / "checkpoint.pth", state={}, strict=False)
-
-
-@RunIf(min_torch="2.3")
 def test_fsdp_v1_modules_unsupported():
     """Test that the strategy won't allow setting up a module wrapped with the legacy FSDP API."""
     from torch.distributed.fsdp import FullyShardedDataParallel
@@ -119,6 +94,7 @@ def test_fsdp_v1_modules_unsupported():
 
 
 @RunIf(min_torch="2.3")
+
 def test_parallelize_fn_call():
     model = nn.Linear(2, 2)
     optimizer = Adam(model.parameters())
