@@ -32,7 +32,6 @@ from lightning.fabric.strategies.fsdp import (
     _get_full_state_dict_context,
     _is_full_checkpoint,
     _is_sharded_checkpoint,
-    _load_raw_module_state_from_path,
 )
 from lightning.fabric.strategies.launchers.subprocess_script import _SubprocessScriptLauncher
 from lightning.fabric.strategies.parallel import ParallelStrategy
