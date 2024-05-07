@@ -474,13 +474,11 @@ def _load_checkpoint(
         return metadata
 
     if _is_full_checkpoint(path):
-        from torch.distributed.checkpoint import load
-        from torch.distributed.checkpoint.state_dict import set_model_state_dict
-
-        
-        from torch.distributed.checkpoint.format_utils import DynamicMetaLoadPlanner, torch_save_to_dcp
         import tempfile
-        
+
+        from torch.distributed.checkpoint import load
+        from torch.distributed.checkpoint.format_utils import DynamicMetaLoadPlanner, torch_save_to_dcp
+
         temp_ckpt_path = tempfile.mkdtemp()
         if rank == 0:
             torch_save_to_dcp(path, temp_ckpt_path)
@@ -488,9 +486,13 @@ def _load_checkpoint(
         obj_list = [temp_ckpt_path]
         torch.distributed.broadcast_object_list(obj_list, src=0)
         temp_ckpt_path = obj_list[0]
-        
+
         sd = {module_key: module}
-        load(sd, checkpoint_id=temp_ckpt_path, planner=DynamicMetaLoadPlanner(flatten_state_dict=False, flatten_sharded_tensors=False))
+        load(
+            sd,
+            checkpoint_id=temp_ckpt_path,
+            planner=DynamicMetaLoadPlanner(flatten_state_dict=False, flatten_sharded_tensors=False),
+        )
         # set_model_state_dict(module, sd[module_key], options=StateDictOptions(cpu_offload=True, strict=strict))
         # module.load_state_dict(sd[module_key])
         # checkpoint = _lazy_load(path)
